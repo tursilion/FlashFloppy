@@ -39,6 +39,22 @@ struct hfe_image {
     uint32_t ticks_per_cell;
 };
 
+struct ipf_image {
+    struct ipf_track *tracks;
+    /* Current track info: */
+    struct ipf_blkinf *blks;
+    uint32_t ticks_per_cell;
+    uint8_t blkcnt;
+    uint32_t trk_off, trk_len;
+    /* Prefetch state: */
+    uint32_t pf_pos;
+    /* Decoded raw bitcells: */
+    uint32_t raw[16], raw_cons;
+    /* Current decoder state: */
+    uint8_t blk, mode, code;
+    uint32_t chk_todo, chk_len;
+};
+
 struct scp_image {
     uint8_t nr_revs;        /* # revolutions per track in image file */
     uint8_t pf_rev, ld_rev; /* Current prefetch/load revolution */
@@ -76,6 +92,7 @@ struct image {
     union {
         struct adf_image adf;
         struct hfe_image hfe;
+        struct ipf_image ipf;
         struct scp_image scp;
     };
 };

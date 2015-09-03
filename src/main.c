@@ -127,7 +127,7 @@ int main(void)
     backlight_set(8);
     touch_init();
 
-    floppy_init("nzs_crack.adf", NULL);
+    floppy_init("nzs_crack.ipf", NULL);
 
     ASSERT(!f_mount(&fatfs, "", 1));
     list_dir("/");

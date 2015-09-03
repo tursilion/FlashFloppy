@@ -11,6 +11,7 @@
 
 extern struct image_handler adf_image_handler;
 extern struct image_handler hfe_image_handler;
+extern struct image_handler ipf_image_handler;
 extern struct image_handler scp_image_handler;
 
 bool_t image_open(struct image *im, const char *name)
@@ -23,6 +24,8 @@ bool_t image_open(struct image *im, const char *name)
         im->handler = &adf_image_handler;
     else if (!strcmp(suffix, "hfe"))
         im->handler = &hfe_image_handler;
+    else if (!strcmp(suffix, "ipf"))
+        im->handler = &ipf_image_handler;
     else if (!strcmp(suffix, "scp"))
         im->handler = &scp_image_handler;
     else
