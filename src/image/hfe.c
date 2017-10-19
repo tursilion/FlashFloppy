@@ -70,6 +70,7 @@ enum {
 
 static bool_t hfe_open(struct image *im)
 {
+    struct image_buf *mfm = im->hfe.read_mfm;
     struct disk_header dhdr;
 
     F_read(&im->fp, &dhdr, sizeof(dhdr), NULL);
@@ -88,6 +89,12 @@ static bool_t hfe_open(struct image *im)
     im->nr_sides = dhdr.nr_sides;
     im->write_bc_ticks = sysclk_us(500) / le16toh(dhdr.bitrate);
 
+    /* Set up the split side0/side1 read mfm buffers. */
+    mfm[0] = im->bufs.read_mfm;
+    mfm[0].len /= 2;
+    mfm[1] = mfm[0];
+    mfm[1].p = (char *)mfm[1].p + mfm[0].len;
+
     return TRUE;
 }
 
@@ -95,6 +102,7 @@ static bool_t hfe_seek_track(
     struct image *im, uint16_t track, stk_time_t *start_pos)
 {
     struct image_buf *rd = &im->bufs.read_data;
+    struct image_buf *mfm = im->hfe.read_mfm;
     uint32_t sys_ticks = start_pos ? *start_pos : 0;
     struct track_header thdr;
     uint8_t cyl = track/2, side = track&1;
@@ -131,10 +139,11 @@ static bool_t hfe_seek_track(
 
     im->hfe.trk_pos = (im->cur_bc/8) & ~255;
     rd->prod = rd->cons = 0;
+    mfm[0].cons = mfm[1].cons = mfm[0].prod = mfm[1].prod = 0;
 
     if (start_pos) {
         image_read_track(im);
-        rd->cons = im->cur_bc & 2047;
+        mfm[0].cons = mfm[1].cons = im->cur_bc & 2047;
         *start_pos = sys_ticks;
     }
 
@@ -144,81 +153,103 @@ static bool_t hfe_seek_track(
 static bool_t hfe_read_track(struct image *im)
 {
     struct image_buf *rd = &im->bufs.read_data;
+    struct image_buf *mfm = im->hfe.read_mfm;
     uint8_t *buf = rd->p;
     unsigned int buflen = (rd->len-256) & ~255;
+    unsigned int side, mfmlen, mfmp, mfmc;
+    uint32_t mfm_curr;
 
-    if ((uint32_t)(rd->prod - rd->cons) > (buflen-512)*8)
+    now_pos <<= 4;
+    if (now_pos > im->cur_ticks)
+        XXX;
+
+    mfm_curr = mfm->cons -
+        (im->cur_ticks - now_pos) / im->hfe.ticks_per_cell;
+
+    if (rd->prod == rd->cons) {
+        F_lseek(&im->fp, im->hfe.trk_off * 512 + im->hfe.trk_pos * 2);
+        F_read(&im->fp, &buf[(rd->prod/8) % buflen], 512, NULL);
+        rd->prod += 256 * 8;
+        im->hfe.trk_pos += 256;
+        if (im->hfe.trk_pos >= im->hfe.trk_len)
+            im->hfe.trk_pos = 0;
+    }
+
+    mfmp = mfm->prod / 8;
+    mfmc = mfm_curr / 8;
+    mfmlen = mfm->len;
+
+    if (mfmlen - (mfmp - mfmc) < 256)
         return FALSE;
 
-    F_lseek(&im->fp, im->hfe.trk_off * 512 + im->hfe.trk_pos * 2);
-    F_read(&im->fp, &buf[(rd->prod/8) % buflen], 512, NULL);
-    if (im->cur_track & 1) {
-        /* Shift track 1 data up to correct position in the ring buffer. */
-        memcpy(&buf[(rd->prod/8) % buflen],
-               &buf[(rd->prod/8) % buflen] + 256,
-               256);
+    for (side = 0; side < 2; side++) {
+        unsigned int done, bytes = 0;
+        for (done = 0; done < 256; done -= bytes) {
+            bytes = min_t(unsigned int, 256, mfmlen - mfmp);
+            memcpy((char *)mfm[side].p + ((mfmp + done) % mfmlen),
+                   buf + (rd->cons/8) % buflen + side*256 + done,
+                   bytes);
+        }
+        mfm[side].prod += 256 * 8;
     }
-    barrier(); /* write data /then/ update producer */
-    rd->prod += 256 * 8;
-    im->hfe.trk_pos += 256;
-    if (im->hfe.trk_pos >= im->hfe.trk_len)
-        im->hfe.trk_pos = 0;
+
+    rd->cons += 256 * 8;
 
     return TRUE;
 }
 
 static uint16_t hfe_rdata_flux(struct image *im, uint16_t *tbuf, uint16_t nr)
 {
-    struct image_buf *rd = &im->bufs.read_data;
+    struct image_buf *mfm = &im->hfe.read_mfm[im->cur_track & 1];
     uint32_t ticks = im->ticks_since_flux;
     uint32_t ticks_per_cell = im->hfe.ticks_per_cell;
     uint32_t y = 8, todo = nr;
-    uint8_t x, *buf = rd->p;
-    unsigned int buflen = (rd->len-256) & ~255;
+    uint8_t x, *mfmb = mfm->p;
+    unsigned int mfmlen = mfm->len;
     bool_t is_v3 = im->hfe.is_v3;
 
-    while ((rd->prod - rd->cons) >= 3*8) {
+    while ((mfm->prod - mfm->cons) >= 3*8) {
         ASSERT(y == 8);
         if (im->cur_bc >= im->tracklen_bc) {
             ASSERT(im->cur_bc == im->tracklen_bc);
             im->tracklen_ticks = im->cur_ticks;
             im->cur_bc = im->cur_ticks = 0;
             /* Skip tail of current 256-byte block. */
-            rd->cons = (rd->cons + 256*8-1) & ~(256*8-1);
+            mfm->cons = (mfm->cons + 256*8-1) & ~(256*8-1);
             continue;
         }
-        y = rd->cons % 8;
-        x = buf[(rd->cons/8) % buflen] >> y;
+        y = mfm->cons % 8;
+        x = mfmb[(mfm->cons/8) % mfmlen] >> y;
         if (is_v3 && (y == 0) && ((x & 0xf) == 0xf)) {
             /* V3 byte-aligned opcode processing. */
             switch (x >> 4) {
             case OP_nop:
             case OP_index:
-                rd->cons += 8;
+                mfm->cons += 8;
                 im->cur_bc += 8;
                 y = 8;
                 continue;
             case OP_bitrate:
-                x = _rbit32(buf[(rd->cons/8+1) % buflen]) >> 24;
+                x = _rbit32(mfmb[(mfm->cons/8+1) % mfmlen]) >> 24;
                 im->hfe.ticks_per_cell = ticks_per_cell = 
                     (sysclk_us(2) * 16 * x) / 72;
-                rd->cons += 2*8;
+                mfm->cons += 2*8;
                 im->cur_bc += 2*8;
                 y = 8;
                 continue;
             case OP_skip:
-                x = (_rbit32(buf[(rd->cons/8+1) % buflen]) >> 24) & 7;
-                rd->cons += 2*8 + x;
+                x = (_rbit32(mfmb[(mfm->cons/8+1) % mfmlen]) >> 24) & 7;
+                mfm->cons += 2*8 + x;
                 im->cur_bc += 2*8 + x;
-                y = rd->cons % 8;
-                x = buf[(rd->cons/8) % buflen] >> y;
+                y = mfm->cons % 8;
+                x = mfmb[(mfm->cons/8) % mfmlen] >> y;
                 break;
             default:
                 /* ignore and process as normal data */
                 break;
             }
         }
-        rd->cons += 8 - y;
+        mfm->cons += 8 - y;
         im->cur_bc += 8 - y;
         im->cur_ticks += (8 - y) * ticks_per_cell;
         while (y < 8) {
@@ -235,7 +266,7 @@ static uint16_t hfe_rdata_flux(struct image *im, uint16_t *tbuf, uint16_t nr)
     }
 
 out:
-    rd->cons -= 8 - y;
+    mfm->cons -= 8 - y;
     im->cur_bc -= 8 - y;
     im->cur_ticks -= (8 - y) * ticks_per_cell;
     im->ticks_since_flux = ticks;

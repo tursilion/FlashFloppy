@@ -16,6 +16,12 @@
 #define FINTF_SHUGART 0
 #define FINTF_IBMPC   1
 
+struct image_buf {
+    void *p;
+    uint32_t len;
+    uint32_t prod, cons;
+};
+
 struct adf_image {
     uint32_t trk_off;
     uint16_t trk_pos, trk_len;
@@ -28,6 +34,7 @@ struct hfe_image {
     uint16_t trk_pos, trk_len;
     uint32_t ticks_per_cell;
     bool_t is_v3;
+    struct image_buf read_mfm[2];
 };
 
 struct img_image {
@@ -46,12 +53,6 @@ struct img_image {
 
 struct directaccess {
     uint32_t lba;
-};
-
-struct image_buf {
-    void *p;
-    uint32_t len;
-    uint32_t prod, cons;
 };
 
 struct image_bufs {
