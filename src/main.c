@@ -903,10 +903,49 @@ static void choose_new_image(uint8_t init_b)
     }
 }
 
-int floppy_main(void)
+static void assert_usbh_msc_connected(void)
 {
+    if (!usbh_msc_connected())
+        F_die();
+}
+
+static int run_floppy(void *_b)
+{
+    volatile uint8_t *pb = _b;
     stk_time_t t_now, t_prev, t_diff;
-    char msg[4];
+
+    floppy_insert(0, &cfg.slot);
+
+    lcd_update_ticks = stk_ms(20);
+    lcd_scroll_ticks = stk_ms(LCD_SCROLL_PAUSE_MSEC);
+    lcd_scroll_off = 0;
+    lcd_scroll_end = max_t(
+        int, strnlen(cfg.slot.name, sizeof(cfg.slot.name)) - 16, 0);
+    t_prev = stk_now();
+    while (((*pb = buttons) == 0) && !floppy_handle()) {
+        t_now = stk_now();
+        t_diff = stk_diff(t_prev, t_now);
+        if (display_mode == DM_LCD_1602) {
+            lcd_update_ticks -= t_diff;
+            if (lcd_update_ticks <= 0) {
+                lcd_write_track_info(FALSE);
+                lcd_update_ticks = stk_ms(20);
+            }
+            lcd_scroll_ticks -= t_diff;
+            lcd_scroll_name();
+        }
+        canary_check();
+        assert_usbh_msc_connected();
+        t_prev = t_now;
+    }
+
+    return 0;
+}
+
+static int floppy_main(void *unused)
+{
+    FRESULT fres;
+    char msg[10];
     uint8_t b;
     uint32_t i;
 
@@ -972,64 +1011,57 @@ int floppy_main(void)
                cfg.slot.attributes, cfg.slot.firstCluster, cfg.slot.size);
 
         if (cfg.ejected) {
-
             cfg.ejected = FALSE;
             b = B_SELECT;
-
         } else {
-
-            floppy_insert(0, &cfg.slot);
-
-            lcd_update_ticks = stk_ms(20);
-            lcd_scroll_ticks = stk_ms(LCD_SCROLL_PAUSE_MSEC);
-            lcd_scroll_off = 0;
-            lcd_scroll_end = max_t(
-                int, strnlen(cfg.slot.name, sizeof(cfg.slot.name)) - 16, 0);
-            t_prev = stk_now();
-            while (((b = buttons) == 0) && !floppy_handle()) {
-                t_now = stk_now();
-                t_diff = stk_diff(t_prev, t_now);
-                if (display_mode == DM_LCD_1602) {
-                    lcd_update_ticks -= t_diff;
-                    if (lcd_update_ticks <= 0) {
-                        lcd_write_track_info(FALSE);
-                        lcd_update_ticks = stk_ms(20);
-                    }
-                    lcd_scroll_ticks -= t_diff;
-                    lcd_scroll_name();
-                }
-                canary_check();
-                if (!usbh_msc_connected())
-                    F_die();
-                t_prev = t_now;
-            }
-
+            fres = F_call_cancellable(run_floppy, &b);
             floppy_cancel();
-
+            assert_usbh_msc_connected();
         }
 
         arena_init();
         fs = arena_alloc(sizeof(*fs));
 
         /* When an image is loaded, select button means eject. */
-        if (b & B_SELECT) {
+        if (fres || (b & B_SELECT)) {
             /* ** EJECT STATE ** */
+            unsigned int wait = 0;
+            snprintf(msg, sizeof(msg), "EJECT");
             switch (display_mode) {
             case DM_LED_7SEG:
-                led_7seg_write_string("EJECT");
+                if (fres)
+                    snprintf(msg, sizeof(msg), "E%02u", fres);
+                led_7seg_write_string(msg);
                 break;
             case DM_LCD_1602:
-                lcd_write(0, 1, 8, "EJECT");
+                if (fres)
+                    snprintf(msg, sizeof(msg), "ERR %02u", fres);
+                lcd_write(0, 1, 8, msg);
                 break;
             }
-            ima_mark_ejected(TRUE);
+            if (fres == FR_OK)
+                ima_mark_ejected(TRUE);
+            fres = FR_OK;
             /* Wait for buttons to be released. */
             while (buttons != 0)
                 continue;
             /* Wait for any button to be pressed. */
             while ((b = buttons) == 0) {
-                if (!usbh_msc_connected())
-                    F_die();
+                /* Bail if USB disconnects. */
+                assert_usbh_msc_connected();
+                /* Alternate the 7-segment display if it's connected. */
+                delay_ms(1);
+                if ((display_mode == DM_LED_7SEG) && ((++wait % 1000) == 0)) {
+                    switch (wait / 1000) {
+                    case 1:
+                        led_7seg_write_decimal(cfg.slot_nr);
+                        break;
+                    default:
+                        led_7seg_write_string(msg);
+                        wait = 0;
+                        break;
+                    }
+                }
             }
             /* Reload same image immediately if eject pressed again. */
             if (b & B_SELECT) {
@@ -1062,8 +1094,7 @@ int floppy_main(void)
                 b = buttons;
                 if (b != 0)
                     break;
-                if (!usbh_msc_connected())
-                    F_die();
+                assert_usbh_msc_connected();
                 delay_ms(1);
             }
 
@@ -1206,7 +1237,7 @@ int main(void)
         }
 
         arena_init();
-        fres = F_call_cancellable(floppy_main);
+        fres = F_call_cancellable(floppy_main, NULL);
         floppy_cancel();
         printk("FATFS RETURN CODE: %u\n", fres);
     }
