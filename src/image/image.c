@@ -13,7 +13,9 @@ extern const struct image_handler adf_image_handler;
 extern const struct image_handler hfe_image_handler;
 extern const struct image_handler img_image_handler;
 extern const struct image_handler st_image_handler;
+extern const struct image_handler dsk_image_handler;
 extern const struct image_handler da_image_handler;
+extern const struct image_handler adl_image_handler;
 
 bool_t image_valid(FILINFO *fp)
 {
@@ -27,10 +29,13 @@ bool_t image_valid(FILINFO *fp)
     filename_extension(fp->fname, ext, sizeof(ext));
     if (!strcmp(ext, "adf")) {
         return !(fp->fsize % (11*512));
-    } else if (!strcmp(ext, "hfe")
+    } else if (!strcmp(ext, "dsk")
+               || !strcmp(ext, "hfe")
                || !strcmp(ext, "img")
                || !strcmp(ext, "ima")
-               || !strcmp(ext, "st")) {
+               || !strcmp(ext, "st")
+               || !strcmp(ext, "adl")
+               || !strcmp(ext, "adm")) {
         return TRUE;
     }
 
@@ -52,10 +57,15 @@ static bool_t try_handler(struct image *im, const struct v2_slot *slot,
     return handler->open(im);
 }
 
-bool_t image_open(struct image *im, const struct v2_slot *slot)
+void image_open(struct image *im, const struct v2_slot *slot)
 {
     static const struct image_handler * const image_handlers[] = {
-        &hfe_image_handler, &adf_image_handler, &img_image_handler
+        /* Formats with an identifying header. */
+        &dsk_image_handler,
+        &hfe_image_handler,
+        /* Header-less formats in some semblance of priority order. */
+        &adf_image_handler,
+        &img_image_handler
     };
 
     char ext[4];
@@ -74,21 +84,31 @@ bool_t image_open(struct image *im, const struct v2_slot *slot)
 
     /* Use the extension as a hint to the correct image handler. */
     hint = (!strcmp(ext, "adf") ? &adf_image_handler
+            : !strcmp(ext, "dsk") ? &dsk_image_handler
             : !strcmp(ext, "hfe") ? &hfe_image_handler
             : !strcmp(ext, "img") ? &img_image_handler
             : !strcmp(ext, "ima") ? &img_image_handler
             : !strcmp(ext, "st") ? &st_image_handler
+            : !strcmp(ext, "adl") ? &adl_image_handler
+            : !strcmp(ext, "adm") ? &adl_image_handler
             : NULL);
-    if (hint && try_handler(im, slot, hint))
-        return TRUE;
+    if (hint) {
+        if (try_handler(im, slot, hint))
+            return;
+        /* Hint failed. Try a secondary hint (allows DSK fallback to IMG). */
+        hint = !strcmp(ext, "dsk") ? &img_image_handler : NULL;
+        if (hint && try_handler(im, slot, hint))
+            return;
+    }
 
     /* Filename extension hinting failed: walk the handler list. */
     for (i = 0; i < ARRAY_SIZE(image_handlers); i++) {
         if (try_handler(im, slot, image_handlers[i]))
-            return TRUE;
+            return;
     }
 
-    return FALSE;
+    /* No handler found: bad image. */
+    F_die(FR_BAD_IMAGE);
 }
 
 bool_t image_seek_track(
@@ -109,7 +129,9 @@ bool_t image_seek_track(
         ? &da_image_handler
         : im->_handler;
 
-    return im->handler->seek_track(im, track, start_pos);
+    im->handler->seek_track(im, track, start_pos);
+
+    return FALSE;
 }
 
 bool_t image_read_track(struct image *im)

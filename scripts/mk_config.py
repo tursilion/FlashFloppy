@@ -25,6 +25,10 @@ def main(argv):
                 val = "FONT_" + val
             elif opt == "image-on-startup":
                 val = "IMGS_" + val
+            elif opt == "twobutton-action":
+                val = "TWOBUTTON_" + val
+            elif opt == "nav-mode":
+                val = "NAVMODE_" + val
             else:
                 val = {
                     'no': 'FALSE',

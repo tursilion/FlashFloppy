@@ -28,6 +28,7 @@ struct hfe_image {
     uint16_t trk_pos, trk_len;
     uint32_t ticks_per_cell;
     bool_t is_v3;
+    uint8_t batch_secs;
 };
 
 struct img_image {
@@ -38,8 +39,19 @@ struct img_image {
     uint8_t gap3;
     int8_t write_sector;
     uint8_t sec_base, sec_map[64];
-    uint8_t nr_sectors;
+    uint8_t nr_sectors, sec_no;
     uint16_t data_rate, gap4;
+    uint32_t ticks_per_cell;
+    uint32_t idx_sz, idam_sz, dam_sz;
+};
+
+struct dsk_image {
+    uint32_t trk_off;
+    uint16_t trk_pos;
+    int32_t decode_pos;
+    bool_t extended;
+    int8_t write_sector;
+    uint16_t gap4;
     uint32_t ticks_per_cell;
     uint32_t idx_sz, idam_sz, dam_sz;
 };
@@ -94,12 +106,13 @@ struct image {
         struct adf_image adf;
         struct hfe_image hfe;
         struct img_image img;
+        struct dsk_image dsk;
     };
 };
 
 struct image_handler {
     bool_t (*open)(struct image *im);
-    bool_t (*seek_track)(
+    void (*seek_track)(
         struct image *im, uint16_t track, stk_time_t *start_pos);
     bool_t (*read_track)(struct image *im);
     uint16_t (*rdata_flux)(struct image *im, uint16_t *tbuf, uint16_t nr);
@@ -111,7 +124,7 @@ struct image_handler {
 bool_t image_valid(FILINFO *fp);
 
 /* Open specified image file on mass storage device. */
-bool_t image_open(struct image *im, const struct v2_slot *slot);
+void image_open(struct image *im, const struct v2_slot *slot);
 
 /* Seek to given track and start reading track data at specified rotational
  * position (specified as number of SYSCLK ticks past the index mark).

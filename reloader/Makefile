@@ -13,11 +13,10 @@ OBJS += string.o
 OBJS += stm32f10x.o
 OBJS += timer.o
 OBJS += util.o
+OBJS += flash_cfg.o
 
 OBJS-$(debug) += console.o
 
 SUBDIRS += fatfs
 SUBDIRS-$(gotek) += gotek
 SUBDIRS-$(touch) += touch
-
-CFLAGS += -DRELOADER=1

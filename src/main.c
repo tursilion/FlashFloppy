@@ -1,7 +1,7 @@
 /*
  * main.c
  * 
- * Bootstrap the STM32F103C8T6 and get things moving.
+ * System initialisation and navigation main loop.
  * 
  * Written & released by Keir Fraser <keir.xen@gmail.com>
  * 
@@ -26,6 +26,7 @@ static struct {
     uint32_t cfg_cdir, cur_cdir;
     uint16_t cdir_stack[20];
     uint8_t depth;
+    bool_t usb_power_fault;
     uint8_t hxc_mode:1;
     uint8_t ejected:1;
     uint8_t ima_ej_flag:1; /* "\\EJ" flag in IMAGE_A.CFG? */
@@ -34,18 +35,6 @@ static struct {
     uint8_t ffcfg_has_display_off_secs:1;
     uint8_t ffcfg_has_display_scroll_rate:1;
 } cfg;
-
-/* FF.CFG: Compiled default values. */
-const struct ff_cfg dfl_ff_cfg = {
-    .version = FFCFG_VERSION,
-    .size = sizeof(struct ff_cfg),
-#define x(n,o,v) .o = v,
-#include "ff_cfg_defaults.h"
-#undef x
-};
-
-/* FF.CFG: User-specified values, and defaults where not specified. */
-struct ff_cfg ff_cfg;
 
 uint8_t board_id;
 
@@ -56,6 +45,17 @@ static uint8_t backlight_state;
 #define BACKLIGHT_OFF          0
 #define BACKLIGHT_SWITCHING_ON 1
 #define BACKLIGHT_ON           2
+
+static bool_t slot_valid(unsigned int i)
+{
+    if (i > cfg.max_slot_nr)
+        return FALSE;
+    if (!cfg.hxc_mode)
+        return TRUE;
+    if (i >= (sizeof(cfg.slot_map)*8))
+        return FALSE;
+    return !!(cfg.slot_map[i/8] & (0x80>>(i&7)));
+}
 
 /* Turn the LCD backlight on, reset the switch-off handler and ticker. */
 static void lcd_on(void)
@@ -93,10 +93,13 @@ static void display_write_slot(void)
     lcd_write(0, 0, 16, msg);
     type = (cfg.slot.attributes & AM_DIR) ? "DIR"
         : slot_type("adf") ? "ADF"
+        : slot_type("dsk") ? "DSK"
         : slot_type("hfe") ? "HFE"
         : slot_type("img") ? "IMG"
         : slot_type("ima") ? "IMA"
         : slot_type("st") ? "ST "
+        : slot_type("adl") ? "ADL"
+        : slot_type("adm") ? "ADM"
         : "UNK";
     if (cfg.hxc_mode) {
         snprintf(msg, sizeof(msg), "%03u/%03u %s",
@@ -198,18 +201,27 @@ static void button_timer_fn(void *unused)
     static uint8_t rotary;
     uint8_t b = 0;
 
+    /* Check PA5 (USBFLT, active low). */
+    if ((board_id == BRDREV_Gotek_enhanced) && !gpio_read_pin(gpioa, 5)) {
+        /* Latch the error and disable USBENA. */
+        cfg.usb_power_fault = TRUE;
+        gpio_write_pin(gpioa, 4, HIGH);
+    }
+
     /* We debounce the switches by waiting for them to be pressed continuously 
      * for 16 consecutive sample periods (16 * 5ms == 80ms) */
 
     bl <<= 1;
     bl |= gpio_read_pin(gpioc, 8);
     if (bl == 0)
-        b |= B_LEFT;
+        b |= (ff_cfg.twobutton_action == TWOBUTTON_rotary)
+            ? B_LEFT|B_RIGHT : B_LEFT;
 
     br <<= 1;
     br |= gpio_read_pin(gpioc, 7);
     if (br == 0)
-        b |= B_RIGHT;
+        b |= (ff_cfg.twobutton_action == TWOBUTTON_rotary)
+            ? B_SELECT : B_RIGHT;
 
     bs <<= 1;
     bs |= gpio_read_pin(gpioc, 6);
@@ -287,6 +299,10 @@ static bool_t native_dir_next(void)
         F_readdir(&fs->dp, &fs->fp);
         if (fs->fp.fname[0] == '\0')
             return FALSE;
+        /* Skip dot files. */
+        if (fs->fp.fname[0] == '.')
+            continue;
+        /* Allow folder navigation when LCD/OLED display is attached. */
         if ((fs->fp.fattrib & AM_DIR) && (display_mode == DM_LCD_1602)
             && ((cfg.depth != 0) || strcmp(fs->fp.fname, "FF")))
             break;
@@ -354,6 +370,13 @@ static void read_ff_cfg(void)
             ff_cfg.autoselect_folder_secs = strtol(opts.arg, NULL, 10);
             break;
 
+        case FFCFG_nav_mode:
+            ff_cfg.nav_mode =
+                !strcmp(opts.arg, "native") ? NAVMODE_native
+                : !strcmp(opts.arg, "indexed") ? NAVMODE_indexed
+                : NAVMODE_default;
+            break;
+
         case FFCFG_nav_loop:
             ff_cfg.nav_loop = !strcmp(opts.arg, "yes");
             break;
@@ -386,6 +409,7 @@ static void read_ff_cfg(void)
             ff_cfg.step_volume = volume;
             cfg.ffcfg_has_step_volume = TRUE;
             break;
+        }
 
         case FFCFG_image_on_startup:
             ff_cfg.image_on_startup =
@@ -393,7 +417,17 @@ static void read_ff_cfg(void)
                 : !strcmp(opts.arg, "last") ? IMGS_last : IMGS_init;
             break;
 
-        }
+        case FFCFG_display_probe_ms:
+            ff_cfg.display_probe_ms = strtol(opts.arg, NULL, 10);
+            break;
+
+        case FFCFG_twobutton_action:
+            ff_cfg.twobutton_action =
+                !strcmp(opts.arg, "rotary") ? TWOBUTTON_rotary
+                : !strcmp(opts.arg, "eject") ? TWOBUTTON_eject
+                : TWOBUTTON_zero;
+            break;
+
         }
     }
 
@@ -431,6 +465,16 @@ static void cfg_init(void)
 
     read_ff_cfg();
     process_ff_cfg_opts();
+
+    switch (ff_cfg.nav_mode) {
+    case NAVMODE_native:
+        goto native_mode;
+    case NAVMODE_indexed:
+        cfg.hxc_mode = TRUE;
+        goto out;
+    default:
+        break;
+    }
 
     /* Probe for HxC compatibility mode. */
     fatfs.cdir = cfg.cur_cdir;
@@ -496,6 +540,8 @@ native_mode:
         /* Terminate the name section, push curdir onto stack, then chdir. */
         *p++ = '\0';
         printk("%u:D: '%s'\n", cfg.depth, fs->buf);
+        if (cfg.depth == ARRAY_SIZE(cfg.cdir_stack))
+            F_die(FR_PATH_TOO_DEEP);
         cfg.cdir_stack[cfg.depth++] = fatfs.cdir;
         fr = f_chdir(fs->buf);
         if (fr)
@@ -571,7 +617,7 @@ static void native_update(uint8_t slot_mode)
             cfg.max_slot_nr++;
         /* Adjust max_slot_nr. Must be at least one 'slot'. */
         if (!cfg.max_slot_nr)
-            F_die();
+            F_die(FR_NO_DIRENTS);
         cfg.max_slot_nr--;
         F_closedir(&fs->dp);
         /* Select last disk_index if not greater than available slots. */
@@ -601,7 +647,7 @@ static void native_update(uint8_t slot_mode)
         if (cfg.slot.attributes & AM_DIR) {
             if (!strcmp(fs->fp.fname, "..")) {
                 /* Strip back to next '/' */
-                if (!p) F_die(); /* must exist */
+                if (!p) F_die(FR_BAD_IMAGECFG); /* must exist */
                 *p = '\0';
                 if ((q = strrchr(fs->buf, '/')) != NULL) {
                     F_lseek(&fs->file, f_tell(&fs->file) - (p-q));
@@ -683,6 +729,37 @@ static void hxc_cfg_update(uint8_t slot_mode)
     if (slot_mode == CFG_WRITE_SLOT_NR)
         mode |= FA_WRITE;
 
+    if (ff_cfg.nav_mode == NAVMODE_indexed) {
+        FRESULT fr;
+        char slot[10];
+        hxc_cfg.index_mode = TRUE;
+        fatfs.cdir = cfg.cfg_cdir;
+        switch (slot_mode) {
+        case CFG_READ_SLOT_NR:
+            cfg.slot_nr = 0;
+            if (ff_cfg.image_on_startup == IMGS_init)
+                break;
+            if ((fr = F_try_open(&fs->file, "IMAGE_A.CFG", FA_READ)) != FR_OK)
+                break;
+            F_read(&fs->file, slot, sizeof(slot), NULL);
+            F_close(&fs->file);
+            slot[sizeof(slot)-1] = '\0';
+            cfg.slot_nr = strtol(slot, NULL, 10);
+            break;
+        case CFG_WRITE_SLOT_NR:
+            if (ff_cfg.image_on_startup != IMGS_last)
+                break;
+            snprintf(slot, sizeof(slot), "%u", cfg.slot_nr);
+            F_open(&fs->file, "IMAGE_A.CFG", FA_WRITE | FA_OPEN_ALWAYS);
+            F_write(&fs->file, slot, strnlen(slot, sizeof(slot)), NULL);
+            F_truncate(&fs->file);
+            F_close(&fs->file);
+            break;
+        }
+        fatfs.cdir = cfg.cur_cdir;
+        goto indexed_mode;
+    }
+
     fatfs_from_slot(&fs->file, &cfg.hxcsdfe, mode);
     F_read(&fs->file, &hxc_cfg, sizeof(hxc_cfg), NULL);
     if (strncmp("HXCFECFGV", hxc_cfg.signature, 9))
@@ -752,8 +829,7 @@ static void hxc_cfg_update(uint8_t slot_mode)
             F_read(&fs->file, &cfg.slot_map, sizeof(cfg.slot_map), NULL);
             cfg.slot_map[0] |= 0x80; /* slot 0 always available */
             /* Find true max_slot_nr: */
-            while (!(cfg.slot_map[cfg.max_slot_nr/8]
-                     & (0x80>>(cfg.max_slot_nr&7))))
+            while (!slot_valid(cfg.max_slot_nr))
                 cfg.max_slot_nr--;
         }
         /* Slot mode: read current slot file info. */
@@ -770,12 +846,13 @@ static void hxc_cfg_update(uint8_t slot_mode)
     bad_signature:
         hxc_cfg.signature[15] = '\0';
         printk("Bad signature '%s'\n", hxc_cfg.signature);
-        F_die();
+        F_die(FR_BAD_HXCSDFE);
 
     }
 
     F_close(&fs->file);
 
+indexed_mode:
     if (hxc_cfg.index_mode) {
 
         char name[16];
@@ -819,15 +896,22 @@ static void hxc_cfg_update(uint8_t slot_mode)
         }
 
         /* Index mode: populate current slot. */
-        snprintf(name, sizeof(name), "DSKA%04u.*", cfg.slot_nr);
-        F_findfirst(&fs->dp, &fs->fp, "", name);
-        F_closedir(&fs->dp);
-        if (fs->fp.fname[0]) {
-            F_open(&fs->file, fs->fp.fname, FA_READ);
-            fs->file.obj.attr = fs->fp.fattrib;
-            fatfs_to_slot(&cfg.slot, &fs->file, fs->fp.fname);
-            F_close(&fs->file);
+        for (;;) {
+            snprintf(name, sizeof(name), "DSKA%04u.*", cfg.slot_nr);
+            F_findfirst(&fs->dp, &fs->fp, "", name);
+            F_closedir(&fs->dp);
+            /* Found a valid image? */
+            if (fs->fp.fname[0])
+                break;
+            /* Fall back to slot 0. If already there, bail with error. */
+            if (cfg.slot_nr == 0)
+                F_die(FR_BAD_IMAGE);
+            cfg.slot_nr = 0;
         }
+        F_open(&fs->file, fs->fp.fname, FA_READ);
+        fs->file.obj.attr = fs->fp.fattrib;
+        fatfs_to_slot(&cfg.slot, &fs->file, fs->fp.fname);
+        F_close(&fs->file);
     }
 
     for (i = 0; i < 3; i++)
@@ -843,11 +927,11 @@ static void cfg_update(uint8_t slot_mode)
 }
 
 /* Based on button presses, change which floppy image is selected. */
-static void choose_new_image(uint8_t init_b)
+static bool_t choose_new_image(uint8_t init_b)
 {
     uint8_t b, prev_b;
     stk_time_t last_change = 0;
-    int i, changes = 0;
+    int old_slot = cfg.slot_nr, i, changes = 0;
 
     for (prev_b = 0, b = init_b;
          (b &= (B_LEFT|B_RIGHT)) != 0;
@@ -870,8 +954,22 @@ static void choose_new_image(uint8_t init_b)
 
         i = cfg.slot_nr;
         if (!(b ^ (B_LEFT|B_RIGHT))) {
+            if (ff_cfg.twobutton_action == TWOBUTTON_eject) {
+                cfg.slot_nr = old_slot;
+                cfg.ejected = TRUE;
+                cfg_update(CFG_KEEP_SLOT_NR);
+                break;
+            }
             i = cfg.slot_nr = 0;
             cfg_update(CFG_KEEP_SLOT_NR);
+            if (ff_cfg.twobutton_action == TWOBUTTON_rotary) {
+                /* Wait for button release, then update display, then
+                 * immediately enter parent-dir (if we're in a subfolder). */
+                while (buttons)
+                    continue;
+                display_write_slot();
+                return (cfg.depth != 0);
+            }
             display_write_slot();
             /* Ignore changes while user is releasing the buttons. */
             while ((stk_diff(last_change, stk_now()) < stk_ms(1000))
@@ -885,7 +983,7 @@ static void choose_new_image(uint8_t init_b)
                         goto b_right;
                     i = cfg.max_slot_nr;
                 }
-            } while (!(cfg.slot_map[i/8] & (0x80>>(i&7))));
+            } while (!slot_valid(i));
         } else { /* b & B_RIGHT */
         b_right:
             do {
@@ -894,19 +992,60 @@ static void choose_new_image(uint8_t init_b)
                         goto b_left;
                     i = 0;
                 }
-            } while (!(cfg.slot_map[i/8] & (0x80>>(i&7))));
+            } while (!slot_valid(i));
         }
 
         cfg.slot_nr = i;
         cfg_update(CFG_KEEP_SLOT_NR);
         display_write_slot();
     }
+
+    return FALSE;
 }
 
-int floppy_main(void)
+static void assert_usbh_msc_connected(void)
 {
+    if (!usbh_msc_connected() || cfg.usb_power_fault)
+        F_die(FR_DISK_ERR);
+}
+
+static int run_floppy(void *_b)
+{
+    volatile uint8_t *pb = _b;
     stk_time_t t_now, t_prev, t_diff;
-    char msg[4];
+
+    floppy_insert(0, &cfg.slot);
+
+    lcd_update_ticks = stk_ms(20);
+    lcd_scroll_ticks = stk_ms(LCD_SCROLL_PAUSE_MSEC);
+    lcd_scroll_off = 0;
+    lcd_scroll_end = max_t(
+        int, strnlen(cfg.slot.name, sizeof(cfg.slot.name)) - 16, 0);
+    t_prev = stk_now();
+    while (((*pb = buttons) == 0) && !floppy_handle()) {
+        t_now = stk_now();
+        t_diff = stk_diff(t_prev, t_now);
+        if (display_mode == DM_LCD_1602) {
+            lcd_update_ticks -= t_diff;
+            if (lcd_update_ticks <= 0) {
+                lcd_write_track_info(FALSE);
+                lcd_update_ticks = stk_ms(20);
+            }
+            lcd_scroll_ticks -= t_diff;
+            lcd_scroll_name();
+        }
+        canary_check();
+        assert_usbh_msc_connected();
+        t_prev = t_now;
+    }
+
+    return 0;
+}
+
+static int floppy_main(void *unused)
+{
+    FRESULT fres;
+    char msg[17];
     uint8_t b;
     uint32_t i;
 
@@ -933,8 +1072,8 @@ int floppy_main(void)
         /* Make sure slot index is on a valid slot. Find next valid slot if 
          * not (and update config). */
         i = cfg.slot_nr;
-        if (!(cfg.slot_map[i/8] & (0x80>>(i&7)))) {
-            while (!(cfg.slot_map[i/8] & (0x80>>(i&7))))
+        if (!slot_valid(i)) {
+            while (!slot_valid(i))
                 if (i++ >= cfg.max_slot_nr)
                     i = 0;
             printk("Updated slot %u -> %u\n", cfg.slot_nr, i);
@@ -944,9 +1083,13 @@ int floppy_main(void)
 
         if (cfg.slot.attributes & AM_DIR) {
             if (!strcmp(fs->fp.fname, "..")) {
+                if (cfg.depth == 0)
+                    F_die(FR_BAD_IMAGECFG);
                 fatfs.cdir = cfg.cur_cdir = cfg.cdir_stack[--cfg.depth];
                 cfg.slot_nr = 0;
             } else {
+                if (cfg.depth == ARRAY_SIZE(cfg.cdir_stack))
+                    F_die(FR_PATH_TOO_DEEP);
                 cfg.cdir_stack[cfg.depth++] = cfg.cur_cdir;
                 F_chdir(fs->fp.fname);
                 cfg.cur_cdir = fatfs.cdir;
@@ -972,69 +1115,92 @@ int floppy_main(void)
                cfg.slot.attributes, cfg.slot.firstCluster, cfg.slot.size);
 
         if (cfg.ejected) {
-
             cfg.ejected = FALSE;
             b = B_SELECT;
-
         } else {
-
-            floppy_insert(0, &cfg.slot);
-
-            lcd_update_ticks = stk_ms(20);
-            lcd_scroll_ticks = stk_ms(LCD_SCROLL_PAUSE_MSEC);
-            lcd_scroll_off = 0;
-            lcd_scroll_end = max_t(
-                int, strnlen(cfg.slot.name, sizeof(cfg.slot.name)) - 16, 0);
-            t_prev = stk_now();
-            while (((b = buttons) == 0) && !floppy_handle()) {
-                t_now = stk_now();
-                t_diff = stk_diff(t_prev, t_now);
-                if (display_mode == DM_LCD_1602) {
-                    lcd_update_ticks -= t_diff;
-                    if (lcd_update_ticks <= 0) {
-                        lcd_write_track_info(FALSE);
-                        lcd_update_ticks = stk_ms(20);
-                    }
-                    lcd_scroll_ticks -= t_diff;
-                    lcd_scroll_name();
-                }
-                canary_check();
-                if (!usbh_msc_connected())
-                    F_die();
-                t_prev = t_now;
-            }
-
+            fres = F_call_cancellable(run_floppy, &b);
             floppy_cancel();
-
+            assert_usbh_msc_connected();
         }
 
         arena_init();
         fs = arena_alloc(sizeof(*fs));
 
         /* When an image is loaded, select button means eject. */
-        if (b & B_SELECT) {
+        if (fres || (b & B_SELECT)) {
             /* ** EJECT STATE ** */
+            unsigned int wait = 0;
+            snprintf(msg, sizeof(msg), "EJECTED");
             switch (display_mode) {
             case DM_LED_7SEG:
-                led_7seg_write_string("EJECT");
+                if (fres)
+                    snprintf(msg, sizeof(msg), "%c%02u",
+                             (fres >= 30) ? 'E' : 'F', fres);
+                led_7seg_write_string(msg);
                 break;
             case DM_LCD_1602:
-                lcd_write(0, 1, 8, "EJECT");
+                if (fres)
+                    snprintf(msg, sizeof(msg), "*%s*%02u*",
+                             (fres >= 30) ? "ERR" : "FAT", fres);
+                lcd_write(8, 1, 8, msg);
+                lcd_on();
                 break;
             }
-            ima_mark_ejected(TRUE);
+            if (fres == FR_OK)
+                ima_mark_ejected(TRUE);
+            fres = FR_OK;
             /* Wait for buttons to be released. */
             while (buttons != 0)
                 continue;
             /* Wait for any button to be pressed. */
             while ((b = buttons) == 0) {
-                if (!usbh_msc_connected())
-                    F_die();
+                /* Bail if USB disconnects. */
+                assert_usbh_msc_connected();
+                /* Update the display. */
+                delay_ms(1);
+                switch (display_mode) {
+                case DM_LED_7SEG:
+                    /* Alternate the 7-segment display. */
+                    if ((++wait % 1000) == 0) {
+                        switch (wait / 1000) {
+                        case 1:
+                            led_7seg_write_decimal(cfg.slot_nr);
+                            break;
+                        default:
+                            led_7seg_write_string(msg);
+                            wait = 0;
+                            break;
+                        }
+                    }
+                    break;
+                case DM_LCD_1602:
+                    /* Continue to scroll long filename. */
+                    lcd_scroll_ticks -= stk_ms(1);
+                    lcd_scroll_name();
+                    break;
+                }
+            }
+            if (ff_cfg.twobutton_action == TWOBUTTON_eject) {
+                /* Wait 50ms for 2-button press. */
+                for (wait = 0; wait < 50; wait++) {
+                    b = buttons;
+                    if ((b & (B_LEFT|B_RIGHT)) == (B_LEFT|B_RIGHT))
+                        b = B_SELECT;
+                    if (b & B_SELECT)
+                        break;
+                    delay_ms(1);
+                }
             }
             /* Reload same image immediately if eject pressed again. */
             if (b & B_SELECT) {
-                while (buttons & B_SELECT)
-                    continue;
+                /* Wait for eject button to be released. */
+                while (b & B_SELECT) {
+                    b = buttons;
+                    if ((ff_cfg.twobutton_action == TWOBUTTON_eject) && b) {
+                        /* Wait for 2-button release. */
+                        b = B_SELECT;
+                    }
+                }
                 ima_mark_ejected(FALSE);
                 continue;
             }
@@ -1052,7 +1218,9 @@ int floppy_main(void)
 
             /* While buttons are pressed we poll them and update current image
              * accordingly. */
-            choose_new_image(b);
+            cfg.ejected = FALSE;
+            if (choose_new_image(b) || cfg.ejected)
+                break;
 
             /* Wait a few seconds for further button presses before acting on 
              * the new image selection. */
@@ -1062,8 +1230,7 @@ int floppy_main(void)
                 b = buttons;
                 if (b != 0)
                     break;
-                if (!usbh_msc_connected())
-                    F_die();
+                assert_usbh_msc_connected();
                 delay_ms(1);
             }
 
@@ -1081,8 +1248,6 @@ int floppy_main(void)
 
         } while (b != 0);
 
-        cfg.ejected = FALSE;
-
         /* Write the slot number resulting from the latest round of button 
          * presses back to the config file. */
         cfg_update(CFG_WRITE_SLOT_NR);
@@ -1092,17 +1257,19 @@ int floppy_main(void)
     return 0;
 }
 
-static void cfg_factory_reset(void)
+static void cfg_maybe_factory_reset(void)
 {
     unsigned int i;
+    uint8_t b = buttons;
 
-    /* Buttons must be pressed for three seconds. */
-    for (i = 0; i < 3000; i++) {
-        if (buttons != (B_LEFT|B_RIGHT))
-            break;
+    /* Need both LEFT and RIGHT pressed, or SELECT alone. */
+    if ((b != (B_LEFT|B_RIGHT)) && (b != B_SELECT))
+        return;
+
+    /* Buttons must be continuously pressed for three seconds. */
+    for (i = 0; (i < 3000) && (buttons == b); i++)
         delay_ms(1);
-    }
-    if (i != 3000)
+    if (buttons != b)
         return;
 
     /* Inform user that factory reset is about to occur. */
@@ -1119,7 +1286,7 @@ static void cfg_factory_reset(void)
     }
 
     /* Wait for buttons to be released... */
-    while (buttons == (B_LEFT|B_RIGHT))
+    while (buttons)
         continue;
 
     /* ...and then do the Flash erase. */
@@ -1148,6 +1315,50 @@ static void banner(void)
     }
 }
 
+static void handle_errors(FRESULT fres)
+{
+    char msg[17];
+    bool_t pwr = cfg.usb_power_fault;
+
+    if (pwr) {
+        printk("USB Power Fault detected!\n");
+        snprintf(msg, sizeof(msg), "USB Power Fault");
+    } else if (usbh_msc_connected() && (fres != FR_OK)) {
+        printk("FATFS RETURN CODE: %u\n", fres);
+        snprintf(msg, sizeof(msg),
+                 (display_mode == DM_LED_7SEG)
+                 ? ((fres >= 30) ? "E%02u" : "F%02u")
+                 : ((fres >= 30) ? "*ERROR* %02u" : "*FATFS* %02u"),
+                 fres);
+    } else {
+        /* No error. Do nothing. */
+        return;
+    }
+
+    switch (display_mode) {
+    case DM_LED_7SEG:
+        led_7seg_write_string(msg);
+        break;
+    case DM_LCD_1602:
+        lcd_write(0, 0, 16, "***************");
+        lcd_write(0, 1, 16, msg);
+        lcd_on();
+        break;
+    }
+
+    /* Wait for buttons to be released, pressed and released again. */
+    while (buttons)
+        continue;
+    while (!buttons && (pwr || usbh_msc_connected()))
+        continue;
+    while (buttons)
+        continue;
+
+    /* On USB power fault we simply reset. */
+    if (pwr)
+        system_reset();
+}
+
 int main(void)
 {
     FRESULT fres;
@@ -1170,10 +1381,12 @@ int main(void)
 
     /* Wait for 5v power to stabilise before initing external peripherals. */
     delay_ms(200);
-
     printk("\n** FlashFloppy v%s for Gotek\n", FW_VER);
     printk("** Keir Fraser <keir.xen@gmail.com>\n");
     printk("** https://github.com/keirf/FlashFloppy\n\n");
+
+    printk("Board: %s\n",
+           (board_id == BRDREV_Gotek_standard) ? "Standard" : "Enhanced");
 
     speaker_init();
 
@@ -1199,16 +1412,16 @@ int main(void)
 
         banner();
 
-        while (f_mount(&fatfs, "", 1) != FR_OK) {
-            if (buttons == (B_LEFT|B_RIGHT))
-                cfg_factory_reset();
+        while ((f_mount(&fatfs, "", 1) != FR_OK) && !cfg.usb_power_fault) {
+            cfg_maybe_factory_reset();
             usbh_msc_process();
         }
 
         arena_init();
-        fres = F_call_cancellable(floppy_main);
+        fres = F_call_cancellable(floppy_main, NULL);
         floppy_cancel();
-        printk("FATFS RETURN CODE: %u\n", fres);
+
+        handle_errors(fres);
     }
 
     return 0;

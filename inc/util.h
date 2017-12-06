@@ -9,7 +9,7 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
-#define FW_VER "0.8.7a"
+#define FW_VER "0.9.5a"
 
 #ifndef NDEBUG
 #define ASSERT(p) do { if (!(p)) illegal(); } while (0)
@@ -175,10 +175,15 @@ static inline bool_t usbh_msc_connected(void) { return FALSE; }
 #endif /* !BUILD_GOTEK */
 
 extern uint8_t board_id;
+
+/* Touch board revisions */
 #define BRDREV_MM150 0
 #define BRDREV_TB160 1
 #define BRDREV_LC150 7
-#define BRDREV_Gotek 8
+
+/* Gotek board revisions */
+#define BRDREV_Gotek_standard 0xf
+#define BRDREV_Gotek_enhanced 0x0
 
 /* Text/data/BSS address ranges. */
 extern char _stext[], _etext[];

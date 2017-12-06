@@ -9,36 +9,36 @@
  * See the file COPYING for more details, or visit <http://unlicense.org>.
  */
 
-static struct cancellation fs_cancellation;
+static struct cancellation fs_cancellation[2];
+static struct cancellation *next_cancellation = &fs_cancellation[0];
 static FRESULT fs_fresult;
 
-FRESULT F_call_cancellable(int (*fn)(void))
+FRESULT F_call_cancellable(int (*fn)(void *), void *arg)
 {
     FRESULT res;
-    ASSERT(!cancellation_is_active(&fs_cancellation));
-    (void)call_cancellable_fn(&fs_cancellation, fn);
+    struct cancellation *c = next_cancellation++;
+    ASSERT((c - fs_cancellation) < ARRAY_SIZE(fs_cancellation));
+    ASSERT(!cancellation_is_active(c));
+    (void)call_cancellable_fn(c, fn, arg);
+    next_cancellation--;
     res = fs_fresult;
     fs_fresult = FR_OK;
     return res;
 }
 
-FRESULT F_fresult(void)
-{
-    return fs_fresult;
-}
-
 static void handle_fr(FRESULT fr)
 {
-    ASSERT(!fs_fresult && cancellation_is_active(&fs_cancellation));
+    struct cancellation *c = next_cancellation - 1;
+    ASSERT(!fs_fresult && (c >= fs_cancellation));
     if (fr == FR_OK)
         return;
     fs_fresult = fr;
-    cancel_call(&fs_cancellation);
+    cancel_call(c);
 }
 
-void F_die(void)
+void F_die(FRESULT fr)
 {
-    handle_fr(FR_DISK_ERR);
+    handle_fr(fr);
 }
 
 FRESULT F_try_open(FIL *fp, const TCHAR *path, BYTE mode)
@@ -79,10 +79,17 @@ void F_read(FIL *fp, void *buff, UINT btr, UINT *br)
     handle_fr(fr);
 }
 
+#if !FF_FS_READONLY
+
 void F_write(FIL *fp, const void *buff, UINT btw, UINT *bw)
 {
     UINT _bw;
-    FRESULT fr = f_write(fp, buff, btw, &_bw);
+    FRESULT fr;
+    if (!fp->dir_ptr) {
+        /* File cannot be resized. Clip the write size. */
+        btw = min_t(UINT, btw, f_size(fp) - f_tell(fp));
+    }
+    fr = f_write(fp, buff, btw, &_bw);
     if (bw != NULL) {
         *bw = _bw;
     } else if ((fr == FR_OK) && (_bw < btw)) {
@@ -97,15 +104,24 @@ void F_sync(FIL *fp)
     handle_fr(fr);
 }
 
-void F_lseek(FIL *fp, DWORD ofs)
-{
-    FRESULT fr = f_lseek(fp, ofs);
-    handle_fr(fr);
-}
-
 void F_truncate(FIL *fp)
 {
     FRESULT fr = f_truncate(fp);
+    handle_fr(fr);
+}
+
+#endif /* !FF_FS_READONLY */
+
+void F_lseek(FIL *fp, DWORD ofs)
+{
+    FRESULT fr = f_lseek(fp, ofs);
+#if !FF_FS_READONLY
+    if (!fp->dir_ptr) {
+        /* File cannot be resized. Clip the seek offset. */
+        ofs = min(ofs, f_size(fp));
+    }
+#endif
+    fr = f_lseek(fp, ofs);
     handle_fr(fr);
 }
 
@@ -124,12 +140,6 @@ void F_closedir(DIR *dp)
 void F_readdir(DIR *dp, FILINFO *fno)
 {
     FRESULT fr = f_readdir(dp, fno);
-    handle_fr(fr);
-}
-
-void F_unlink(const TCHAR *path)
-{
-    FRESULT fr = f_unlink(path);
     handle_fr(fr);
 }
 

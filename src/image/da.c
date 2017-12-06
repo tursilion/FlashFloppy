@@ -25,7 +25,7 @@ static struct da_status_sector dass = {
 #define TRACKLEN_BC 100160 /* multiple of 32 */
 #define TICKS_PER_CELL ((sysclk_ms(DRIVE_MS_PER_REV) * 16u) / TRACKLEN_BC)
 
-static bool_t da_seek_track(
+static void da_seek_track(
     struct image *im, uint16_t track, stk_time_t *start_pos)
 {
     struct image_buf *rd = &im->bufs.read_data;
@@ -54,8 +54,6 @@ static bool_t da_seek_track(
         image_read_track(im);
         *start_pos = 0;
     }
-
-    return FALSE;
 }
 
 static bool_t da_read_track(struct image *im)
@@ -74,7 +72,7 @@ static bool_t da_read_track(struct image *im)
     /* Read some sectors. */
     if (!rd->prod) {
         if (disk_read(0, buf + sec_sz, dass.lba_base, nr_sec-1) != RES_OK)
-            F_die();
+            F_die(FR_DISK_ERR);
         rd->prod = nr_sec * sec_sz;
     }
 
@@ -265,7 +263,7 @@ static void da_write_track(struct image *im, bool_t flush)
             printk("Write %08x+%u... ", dass.lba_base, sect-1);
             t = stk_now();
             if (disk_write(0, wrbuf, dass.lba_base+sect-1, 1) != RES_OK)
-                F_die();
+                F_die(FR_DISK_ERR);
             printk("%u us\n", stk_diff(t, stk_now()) / STK_MHZ);
         }
     }
